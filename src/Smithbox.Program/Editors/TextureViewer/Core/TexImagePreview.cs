@@ -102,32 +102,20 @@ public class TexImagePreview : IResourceEventListener
                 return TryDisplayLastValidTexture(resourceKey, contextKey);
             }
 
-            // NOVA: Verificar se já temos um recurso carregado e se mudou apenas a SubTexture
+            // NOVA: Verificar se já temos um recurso carregado e válido
             if (LoadedResources.ContainsKey(resourceKey))
             {
                 var currentResource = LoadedResources[resourceKey];
                 
                 if (currentResource != null && currentResource.GPUTexture != null)
                 {
-                    // Tentar obter nova SubTexture sem recarregar a textura base
-                    var newSubTexture = GetPreviewSubTexture(currentResource.Name, context, iconConfig, iconEntry, fieldValue, fieldName);
+                    _lastValidTexture[contextKey] = currentResource;
                     
-                    if (newSubTexture != null)
+                    if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
                     {
-                        // Se encontrou uma SubTexture válida, apenas atualiza ela
-                        if (currentResource.SubTexture == null || currentResource.SubTexture.Name != newSubTexture.Name)
-                        {
-                            currentResource.SubTexture = newSubTexture;
-                        }
-                        
-                        _lastValidTexture[contextKey] = currentResource;
-                        
-                        if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
-                        {
-                            DisplayImage(currentResource);
-                        }
-                        return true;
+                        DisplayImage(currentResource);
                     }
+                    return true;
                 }
             }
 
