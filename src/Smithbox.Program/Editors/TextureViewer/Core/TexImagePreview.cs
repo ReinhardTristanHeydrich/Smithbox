@@ -37,11 +37,15 @@ public class TexImagePreview : IResourceEventListener
 
     private Dictionary<string, TextureResource> LoadedResources = new();
     
-    // NOVA: Cache para evitar flickering - armazena a última textura válida por contexto
-    private Dictionary<string, TextureResource> _lastValidTexture = new();
+    // NOVA: Cache persistente para evitar flickering - a key é baseada no valor do campo
+    private Dictionary<string, TextureResource> _stableCache = new();
     
-    // NOVA: Cache para evitar recriações desnecessárias durante mudanças de ícone
-    private Dictionary<string, bool> _isUpdating = new();
+    // NOVA: Cache do último valor válido para cada contexto
+    private Dictionary<string, (object lastValue, TextureResource resource)> _valueCache = new();
+    
+    // NOVA: Contador de frames para evitar múltiplas operações no mesmo frame
+    private Dictionary<string, int> _lastUpdateFrame = new();
+    private int _currentFrame = 0;
 
     public void ClearIcons()
     {
@@ -49,16 +53,23 @@ public class TexImagePreview : IResourceEventListener
         {
             entry.Value.Dispose();
         }
-
         LoadedResources.Clear();
         
-        // NOVA: Limpar também os novos caches
-        foreach (var texture in _lastValidTexture.Values)
+        // NOVA: Limpar caches
+        foreach (var entry in _stableCache)
         {
-            texture?.Dispose();
+            entry.Value?.Dispose();
         }
-        _lastValidTexture.Clear();
-        _isUpdating.Clear();
+        _stableCache.Clear();
+        
+        foreach (var entry in _valueCache)
+        {
+            entry.Value.resource?.Dispose();
+        }
+        _valueCache.Clear();
+        
+        _lastUpdateFrame.Clear();
+        _currentFrame = 0;
     }
 
     /// <summary>
@@ -66,96 +77,127 @@ public class TexImagePreview : IResourceEventListener
     /// </summary>
     public bool DisplayImagePreview(Param.Row context, IconConfig iconConfig, object fieldValue, string fieldName, int columnIndex)
     {
+        _currentFrame++; // Incrementar contador de frames
+        
         var resourceKey = $"{fieldName}_{columnIndex}";
-        var contextKey = $"{context?.ID}_{fieldName}_{fieldValue}";
+        var contextKey = $"{context?.ID}_{fieldName}";
+        var stableCacheKey = $"{contextKey}_{fieldValue}";
 
-        // NOVA: Prevenir múltiplas atualizações simultâneas que causam flickering
-        if (_isUpdating.ContainsKey(contextKey) && _isUpdating[contextKey])
+        // NOVA: Se já renderizamos neste frame, usa cache
+        if (_lastUpdateFrame.ContainsKey(contextKey) && _lastUpdateFrame[contextKey] == _currentFrame)
         {
-            return TryDisplayLastValidTexture(resourceKey, contextKey);
+            return TryDisplayFromCache(resourceKey, contextKey, stableCacheKey);
+        }
+        
+        _lastUpdateFrame[contextKey] = _currentFrame;
+
+        // NOVA: Verificar se o valor mudou
+        bool valueChanged = true;
+        if (_valueCache.ContainsKey(contextKey))
+        {
+            var (lastValue, _) = _valueCache[contextKey];
+            valueChanged = !Equals(lastValue, fieldValue);
         }
 
-        _isUpdating[contextKey] = true;
-
-        try
+        // Se valor não mudou e temos recurso válido, usar cache
+        if (!valueChanged && _stableCache.ContainsKey(stableCacheKey))
         {
-            if (Project.ParamData.IconConfigurations == null)
+            var cachedResource = _stableCache[stableCacheKey];
+            if (cachedResource?.GPUTexture != null)
             {
-                return TryDisplayLastValidTexture(resourceKey, contextKey);
-            }
-
-            // Check Icon Config, if not present then don't attempt to load or display anything
-            if (iconConfig == null)
-            {
-                return TryDisplayLastValidTexture(resourceKey, contextKey);
-            }
-
-            if (Project.ParamData.IconConfigurations.Configurations == null)
-            {
-                return TryDisplayLastValidTexture(resourceKey, contextKey);
-            }
-
-            var iconEntry = Project.ParamData.IconConfigurations.Configurations.Where(e => e.Name == iconConfig.TargetConfiguration).FirstOrDefault();
-
-            if (iconEntry == null)
-            {
-                return TryDisplayLastValidTexture(resourceKey, contextKey);
-            }
-
-            // NOVA: Verificar se já temos um recurso carregado e válido
-            if (LoadedResources.ContainsKey(resourceKey))
-            {
-                var currentResource = LoadedResources[resourceKey];
-                
-                if (currentResource != null && currentResource.GPUTexture != null)
-                {
-                    _lastValidTexture[contextKey] = currentResource;
-                    
-                    if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
-                    {
-                        DisplayImage(currentResource);
-                    }
-                    return true;
-                }
-            }
-
-            // Se chegou aqui, precisa carregar uma nova textura
-            return LoadNewTexture(resourceKey, contextKey, iconEntry, context, iconConfig, fieldValue, fieldName);
-        }
-        finally
-        {
-            _isUpdating[contextKey] = false;
-        }
-    }
-
-    // NOVA: Método para tentar exibir a última textura válida (anti-flickering)
-    private bool TryDisplayLastValidTexture(string resourceKey, string contextKey)
-    {
-        if (_lastValidTexture.ContainsKey(contextKey))
-        {
-            var lastResource = _lastValidTexture[contextKey];
-            
-            if (lastResource?.GPUTexture != null)
-            {
-                // Garantir que está no LoadedResources também
-                if (!LoadedResources.ContainsKey(resourceKey))
-                {
-                    LoadedResources[resourceKey] = lastResource;
-                }
-                
+                LoadedResources[resourceKey] = cachedResource;
                 if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
                 {
-                    DisplayImage(lastResource);
+                    DisplayImage(cachedResource);
                 }
                 return true;
             }
         }
-        
+
+        // Verificações básicas
+        if (Project.ParamData.IconConfigurations?.Configurations == null || iconConfig == null)
+        {
+            return TryDisplayFromCache(resourceKey, contextKey, stableCacheKey);
+        }
+
+        var iconEntry = Project.ParamData.IconConfigurations.Configurations
+            .FirstOrDefault(e => e.Name == iconConfig.TargetConfiguration);
+
+        if (iconEntry == null)
+        {
+            return TryDisplayFromCache(resourceKey, contextKey, stableCacheKey);
+        }
+
+        // NOVA: Só recarregar se realmente necessário
+        if (valueChanged || !_stableCache.ContainsKey(stableCacheKey))
+        {
+            var success = LoadNewTexture(resourceKey, stableCacheKey, iconEntry, context, iconConfig, fieldValue, fieldName);
+            
+            if (success)
+            {
+                // Atualizar cache de valores
+                _valueCache[contextKey] = (fieldValue, _stableCache[stableCacheKey]);
+            }
+            
+            return success;
+        }
+
+        // Se chegou aqui, tenta usar o que já tem
+        return TryDisplayFromCache(resourceKey, contextKey, stableCacheKey);
+    }
+
+    // NOVA: Método para tentar exibir do cache
+    private bool TryDisplayFromCache(string resourceKey, string contextKey, string stableCacheKey)
+    {
+        // Primeiro tenta cache estável
+        if (_stableCache.ContainsKey(stableCacheKey))
+        {
+            var resource = _stableCache[stableCacheKey];
+            if (resource?.GPUTexture != null)
+            {
+                LoadedResources[resourceKey] = resource;
+                if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
+                {
+                    DisplayImage(resource);
+                }
+                return true;
+            }
+        }
+
+        // Depois tenta cache de valores
+        if (_valueCache.ContainsKey(contextKey))
+        {
+            var (_, resource) = _valueCache[contextKey];
+            if (resource?.GPUTexture != null)
+            {
+                LoadedResources[resourceKey] = resource;
+                if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
+                {
+                    DisplayImage(resource);
+                }
+                return true;
+            }
+        }
+
+        // Por último, tenta LoadedResources
+        if (LoadedResources.ContainsKey(resourceKey))
+        {
+            var resource = LoadedResources[resourceKey];
+            if (resource?.GPUTexture != null)
+            {
+                if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
+                {
+                    DisplayImage(resource);
+                }
+                return true;
+            }
+        }
+
         return false;
     }
 
-    // NOVA: Método para carregar nova textura (refatorado do código original)
-    private bool LoadNewTexture(string resourceKey, string contextKey, IconConfigurationEntry iconEntry, 
+    // NOVA: Método para carregar nova textura (refatorado)
+    private bool LoadNewTexture(string resourceKey, string stableCacheKey, IconConfigurationEntry iconEntry, 
         Param.Row context, IconConfig iconConfig, object fieldValue, string fieldName)
     {
         var targetFile = Project.TextureData.TextureFiles.Entries.FirstOrDefault(e => e.Filename == iconEntry.File);
@@ -163,58 +205,67 @@ public class TexImagePreview : IResourceEventListener
         if (targetFile == null)
             return false;
 
-        Task<bool> loadTask = Project.TextureData.PrimaryBank.LoadTextureBinder(targetFile);
-        Task.WaitAll(loadTask);
-
-        var targetBinder = Project.TextureData.PrimaryBank.Entries.FirstOrDefault(e => e.Key.Filename == targetFile.Filename);
-        if (targetBinder.Value == null)
-            return false;
-
-        int index = 0;
-        SubTexture curPreviewTexture = null;
-        TextureResource newResource = null;
-
-        // TPF
-        foreach (var entry in targetBinder.Value.Files)
+        try
         {
-            var curTpf = entry.Value;
-            index = 0;
+            Task<bool> loadTask = Project.TextureData.PrimaryBank.LoadTextureBinder(targetFile);
+            Task.WaitAll(loadTask);
 
-            foreach (var curTex in curTpf.Textures)
+            var targetBinder = Project.TextureData.PrimaryBank.Entries.FirstOrDefault(e => e.Key.Filename == targetFile.Filename);
+            if (targetBinder.Value == null)
+                return false;
+
+            int index = 0;
+            SubTexture curPreviewTexture = null;
+            TextureResource newResource = null;
+
+            // TPF
+            foreach (var entry in targetBinder.Value.Files)
             {
-                foreach (var curInternalFilename in iconEntry.InternalFiles)
+                var curTpf = entry.Value;
+                index = 0;
+
+                foreach (var curTex in curTpf.Textures)
                 {
-                    if (curTex.Name == curInternalFilename)
+                    foreach (var curInternalFilename in iconEntry.InternalFiles)
                     {
-                        curPreviewTexture = GetPreviewSubTexture(curTex.Name, context, 
-                            iconConfig, iconEntry, fieldValue, fieldName);
-
-                        if (curPreviewTexture != null)
+                        if (curTex.Name == curInternalFilename)
                         {
-                            // Dispose do recurso anterior se existir
-                            if (LoadedResources.ContainsKey(resourceKey))
+                            curPreviewTexture = GetPreviewSubTexture(curTex.Name, context, 
+                                iconConfig, iconEntry, fieldValue, fieldName);
+
+                            if (curPreviewTexture != null)
                             {
-                                LoadedResources[resourceKey].Dispose();
+                                newResource = new TextureResource(curTpf, index);
+                                newResource.SubTexture = curPreviewTexture;
+                                newResource._LoadTexture(AccessLevel.AccessFull);
+
+                                // NOVA: Dispose do recurso anterior no cache estável
+                                if (_stableCache.ContainsKey(stableCacheKey))
+                                {
+                                    _stableCache[stableCacheKey]?.Dispose();
+                                }
+
+                                // NOVA: Armazenar em cache estável
+                                _stableCache[stableCacheKey] = newResource;
+                                LoadedResources[resourceKey] = newResource;
+
+                                if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
+                                {
+                                    DisplayImage(newResource);
+                                }
+                                
+                                return true;
                             }
-
-                            newResource = new TextureResource(curTpf, index);
-                            newResource.SubTexture = curPreviewTexture;
-                            newResource._LoadTexture(AccessLevel.AccessFull);
-
-                            LoadedResources[resourceKey] = newResource;
-                            _lastValidTexture[contextKey] = newResource;
-
-                            if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
-                            {
-                                DisplayImage(newResource);
-                            }
-                            
-                            return true;
                         }
                     }
+                    index++;
                 }
-                index++;
             }
+        }
+        catch
+        {
+            // Em caso de erro, tenta usar cache
+            return TryDisplayFromCache(resourceKey, "", stableCacheKey);
         }
 
         return false;
