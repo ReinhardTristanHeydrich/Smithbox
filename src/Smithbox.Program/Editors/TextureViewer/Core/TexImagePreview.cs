@@ -1,5 +1,4 @@
-﻿//Pray god it works correctly.
-using Andre.Formats;
+﻿using Andre.Formats;
 using CsvHelper.Configuration.Attributes;
 using DotNext.Collections.Generic;
 using Hexa.NET.ImGui;
@@ -39,10 +38,10 @@ public class TexImagePreview : IResourceEventListener
     private Dictionary<string, TextureResource> LoadedResources = new();
     
     // NOVA: Cache para evitar flickering - armazena a última textura válida por contexto
-    private Dictionary<string, (TextureResource resource, SubTexture subTexture)> _lastValidTexture = new();
+    private Dictionary<string, TextureResource> _lastValidTexture = new();
     
-    // NOVA: Cache de texturas base por arquivo para evitar recarregamentos desnecessários
-    private Dictionary<string, Dictionary<string, TextureResource>> _baseTextureCache = new();
+    // NOVA: Cache para evitar recriações desnecessárias durante mudanças de ícone
+    private Dictionary<string, bool> _isUpdating = new();
 
     public void ClearIcons()
     {
@@ -54,16 +53,12 @@ public class TexImagePreview : IResourceEventListener
         LoadedResources.Clear();
         
         // NOVA: Limpar também os novos caches
-        _lastValidTexture.Clear();
-        
-        foreach (var fileCache in _baseTextureCache.Values)
+        foreach (var texture in _lastValidTexture.Values)
         {
-            foreach (var texture in fileCache.Values)
-            {
-                texture.Dispose();
-            }
+            texture?.Dispose();
         }
-        _baseTextureCache.Clear();
+        _lastValidTexture.Clear();
+        _isUpdating.Clear();
     }
 
     /// <summary>
@@ -74,93 +69,75 @@ public class TexImagePreview : IResourceEventListener
         var resourceKey = $"{fieldName}_{columnIndex}";
         var contextKey = $"{context?.ID}_{fieldName}_{fieldValue}";
 
-        if (Project.ParamData.IconConfigurations == null)
-            return false;
-
-        // Check Icon Config, if not present then don't attempt to load or display anything
-        if (iconConfig == null)
-        {
-            // NOVA: Se não há config mas temos uma textura válida anterior, usa ela para evitar flickering
-            return TryDisplayLastValidTexture(resourceKey, contextKey);
-        }
-
-        if (Project.ParamData.IconConfigurations.Configurations == null)
+        // NOVA: Prevenir múltiplas atualizações simultâneas que causam flickering
+        if (_isUpdating.ContainsKey(contextKey) && _isUpdating[contextKey])
         {
             return TryDisplayLastValidTexture(resourceKey, contextKey);
         }
 
-        var iconEntry = Project.ParamData.IconConfigurations.Configurations.Where(e => e.Name == iconConfig.TargetConfiguration).FirstOrDefault();
+        _isUpdating[contextKey] = true;
 
-        if (iconEntry == null)
+        try
         {
-            return TryDisplayLastValidTexture(resourceKey, contextKey);
-        }
-
-        // NOVA: Verificar se já temos a textura correta carregada para este contexto específico
-        if (LoadedResources.ContainsKey(resourceKey))
-        {
-            var currentResource = LoadedResources[resourceKey];
-            var newSubTexture = GetPreviewSubTexture(currentResource.Name, context, iconConfig, iconEntry, fieldValue, fieldName);
-            
-            // Se a SubTexture mudou, apenas atualizamos ela sem recriar a TextureResource
-            if (newSubTexture != null && (currentResource.SubTexture == null || 
-                currentResource.SubTexture.Name != newSubTexture.Name))
+            if (Project.ParamData.IconConfigurations == null)
             {
-                currentResource.SubTexture = newSubTexture;
-                _lastValidTexture[contextKey] = (currentResource, newSubTexture);
+                return TryDisplayLastValidTexture(resourceKey, contextKey);
             }
-            
-            if (currentResource.GPUTexture != null && CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
+
+            // Check Icon Config, if not present then don't attempt to load or display anything
+            if (iconConfig == null)
             {
-                DisplayImage(currentResource);
-                return true;
+                return TryDisplayLastValidTexture(resourceKey, contextKey);
             }
-        }
 
-        // NOVA: Tentar usar cache de textura base primeiro
-        var targetFile = Project.TextureData.TextureFiles.Entries.FirstOrDefault(e => e.Filename == iconEntry.File);
-        if (targetFile == null)
-        {
-            return TryDisplayLastValidTexture(resourceKey, contextKey);
-        }
-
-        // Se a textura base já está carregada, reutilizar
-        if (_baseTextureCache.ContainsKey(iconEntry.File))
-        {
-            var cachedTextures = _baseTextureCache[iconEntry.File];
-            var newSubTexture = GetPreviewSubTexture("", context, iconConfig, iconEntry, fieldValue, fieldName);
-            
-            if (newSubTexture != null)
+            if (Project.ParamData.IconConfigurations.Configurations == null)
             {
-                // Procurar pela textura que contém nossa SubTexture
-                foreach (var cachedTexture in cachedTextures.Values)
+                return TryDisplayLastValidTexture(resourceKey, contextKey);
+            }
+
+            var iconEntry = Project.ParamData.IconConfigurations.Configurations.Where(e => e.Name == iconConfig.TargetConfiguration).FirstOrDefault();
+
+            if (iconEntry == null)
+            {
+                return TryDisplayLastValidTexture(resourceKey, contextKey);
+            }
+
+            // NOVA: Verificar se já temos um recurso carregado e se mudou apenas a SubTexture
+            if (LoadedResources.ContainsKey(resourceKey))
+            {
+                var currentResource = LoadedResources[resourceKey];
+                
+                if (currentResource != null && currentResource.GPUTexture != null)
                 {
-                    if (cachedTexture.Name == newSubTexture.Name.Split('_')[0] || 
-                        DoesTextureContainSubTexture(cachedTexture.Name, newSubTexture))
+                    // Tentar obter nova SubTexture sem recarregar a textura base
+                    var newSubTexture = GetPreviewSubTexture(currentResource.Name, context, iconConfig, iconEntry, fieldValue, fieldName);
+                    
+                    if (newSubTexture != null)
                     {
-                        // Criar uma nova instância apenas com SubTexture diferente
-                        var resourceCopy = CloneResourceWithNewSubTexture(cachedTexture, newSubTexture);
-                        
-                        if (LoadedResources.ContainsKey(resourceKey))
+                        // Se encontrou uma SubTexture válida, apenas atualiza ela
+                        if (currentResource.SubTexture == null || currentResource.SubTexture.Name != newSubTexture.Name)
                         {
-                            LoadedResources[resourceKey].Dispose();
+                            currentResource.SubTexture = newSubTexture;
                         }
                         
-                        LoadedResources[resourceKey] = resourceCopy;
-                        _lastValidTexture[contextKey] = (resourceCopy, newSubTexture);
+                        _lastValidTexture[contextKey] = currentResource;
                         
                         if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
                         {
-                            DisplayImage(resourceCopy);
+                            DisplayImage(currentResource);
                         }
                         return true;
                     }
                 }
             }
-        }
 
-        // Se chegou aqui, precisa carregar a textura pela primeira vez
-        return LoadNewTexture(resourceKey, contextKey, iconEntry, targetFile, context, iconConfig, fieldValue, fieldName);
+            // Se chegou aqui, precisa carregar uma nova textura
+            return LoadNewTexture(resourceKey, contextKey, iconEntry, context, iconConfig, fieldValue, fieldName);
+        }
+        finally
+        {
+            _isUpdating[contextKey] = false;
+        }
     }
 
     // NOVA: Método para tentar exibir a última textura válida (anti-flickering)
@@ -168,11 +145,11 @@ public class TexImagePreview : IResourceEventListener
     {
         if (_lastValidTexture.ContainsKey(contextKey))
         {
-            var (lastResource, lastSubTexture) = _lastValidTexture[contextKey];
+            var lastResource = _lastValidTexture[contextKey];
             
             if (lastResource?.GPUTexture != null)
             {
-                // Usar a última textura válida para evitar flickering
+                // Garantir que está no LoadedResources também
                 if (!LoadedResources.ContainsKey(resourceKey))
                 {
                     LoadedResources[resourceKey] = lastResource;
@@ -189,45 +166,21 @@ public class TexImagePreview : IResourceEventListener
         return false;
     }
 
-    // NOVA: Método para clonar recurso com nova SubTexture
-    private TextureResource CloneResourceWithNewSubTexture(TextureResource original, SubTexture newSubTexture)
-    {
-        var clone = new TextureResource(original.TpfFile, original.TexIndex);
-        clone.SubTexture = newSubTexture;
-        clone._LoadTexture(AccessLevel.AccessFull);
-        return clone;
-    }
-
-    // NOVA: Verifica se uma textura contém determinada SubTexture
-    private bool DoesTextureContainSubTexture(string textureName, SubTexture subTexture)
-    {
-        if (Editor.Project.TextureData.PrimaryBank.ShoeboxEntries == null)
-            return false;
-
-        var shoeboxEntry = Editor.Project.TextureData.PrimaryBank.ShoeboxEntries.FirstOrDefault();
-        if (shoeboxEntry.Value?.Textures == null)
-            return false;
-
-        return shoeboxEntry.Value.Textures.ContainsKey(textureName) &&
-               shoeboxEntry.Value.Textures[textureName].Any(st => st.Name == subTexture.Name);
-    }
-
     // NOVA: Método para carregar nova textura (refatorado do código original)
     private bool LoadNewTexture(string resourceKey, string contextKey, IconConfigurationEntry iconEntry, 
-        TextureFileEntry targetFile, Param.Row context, IconConfig iconConfig, object fieldValue, string fieldName)
+        Param.Row context, IconConfig iconConfig, object fieldValue, string fieldName)
     {
+        var targetFile = Project.TextureData.TextureFiles.Entries.FirstOrDefault(e => e.Filename == iconEntry.File);
+
+        if (targetFile == null)
+            return false;
+
         Task<bool> loadTask = Project.TextureData.PrimaryBank.LoadTextureBinder(targetFile);
         Task.WaitAll(loadTask);
 
         var targetBinder = Project.TextureData.PrimaryBank.Entries.FirstOrDefault(e => e.Key.Filename == targetFile.Filename);
         if (targetBinder.Value == null)
             return false;
-
-        // Inicializar cache da textura base se necessário
-        if (!_baseTextureCache.ContainsKey(iconEntry.File))
-        {
-            _baseTextureCache[iconEntry.File] = new Dictionary<string, TextureResource>();
-        }
 
         int index = 0;
         SubTexture curPreviewTexture = null;
@@ -250,26 +203,18 @@ public class TexImagePreview : IResourceEventListener
 
                         if (curPreviewTexture != null)
                         {
-                            newResource = new TextureResource(curTpf, index);
-                            newResource.SubTexture = curPreviewTexture;
-                            newResource._LoadTexture(AccessLevel.AccessFull);
-
-                            // Adicionar ao cache base
-                            if (!_baseTextureCache[iconEntry.File].ContainsKey(curTex.Name))
-                            {
-                                var baseResource = new TextureResource(curTpf, index);
-                                baseResource._LoadTexture(AccessLevel.AccessFull);
-                                _baseTextureCache[iconEntry.File][curTex.Name] = baseResource;
-                            }
-
-                            // Adicionar ao cache de recursos
+                            // Dispose do recurso anterior se existir
                             if (LoadedResources.ContainsKey(resourceKey))
                             {
                                 LoadedResources[resourceKey].Dispose();
                             }
-                            
+
+                            newResource = new TextureResource(curTpf, index);
+                            newResource.SubTexture = curPreviewTexture;
+                            newResource._LoadTexture(AccessLevel.AccessFull);
+
                             LoadedResources[resourceKey] = newResource;
-                            _lastValidTexture[contextKey] = (newResource, curPreviewTexture);
+                            _lastValidTexture[contextKey] = newResource;
 
                             if (CFG.Current.Param_FieldContextMenu_ImagePreview_FieldColumn)
                             {
